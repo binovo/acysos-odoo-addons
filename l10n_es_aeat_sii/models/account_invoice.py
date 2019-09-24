@@ -846,12 +846,10 @@ class AccountInvoice(models.Model):
                         unicode(res_line['DescripcionErrorRegistro'])[:60])
                 self.sii_send_error = send_error
             except Exception as fault:
+                _logger.error(fault)
                 self.env['aeat.sii.result'].create_result(
                     invoice, False, 'normal', fault, 'account.invoice')
                 self.sii_send_error = fault
-            finally:
-                # avoid transaction rollback
-                self._cr.commit()
 
     @api.multi
     def send_recc_payment_registry(self, move):
@@ -968,11 +966,29 @@ class AccountInvoice(models.Model):
     @api.multi
     def send_sii(self):
         queue_obj = self.env['queue.job']
+        if 1 < len(self):
+            _logger.info("SII. Sending multiple invoices at once:\n%s" % self)
+            invoices_sii_sent = {}
         for invoice in self:
             company = invoice.company_id
             if company.sii_enabled:
                 if not company.use_connector:
                     invoice._send_invoice_to_sii()
+                    if 1 < len(self):
+                        invoices_sii_sent[invoice.id] = invoice.sii_sent
+                        try:
+                            sii_results = "\n".join([
+                                "type_communication: '%s'. sent_state: '%s'. csv: '%s'. registry_error_description: %s" %
+                                (sii_res.type_communication, sii_res.sent_state, sii_res.csv,
+                                 sii_res.registry_error_description)
+                                for sii_res in invoice.sii_results
+                            ])
+                            _logger.info(
+                                "SII. Invoice: %s. Sent: %s. Results:\n%s"
+                                % (invoice, invoice.sii_sent, sii_results))
+                        except Exception as e:
+                            _logger.error("SII. An error ocurred while trying to build the log message")
+                            _logger.error(e)
                 else:
                     eta = company._get_sii_eta()
                     session = ConnectorSession.from_env(self.env)
@@ -982,6 +998,16 @@ class AccountInvoice(models.Model):
                         ('uuid', '=', new_delay)
                     ], limit=1)
                     invoice.invoice_jobs_ids |= queue_ids
+        if 1 < len(self):
+            for invoice in self:
+                company = invoice.company_id
+                if not company.sii_enabled or company.use_connector or 'manual' != company.sii_method:
+                    continue
+                if invoice.sii_sent != invoices_sii_sent[invoice.id]:
+                    _logger.error("SII. Invoice: %s sii_sent should be %s" % (invoice, invoices_sii_sent[invoice.id]))
+                elif invoice.sii_sent:
+                    if 0 == len(invoice.sii_results):
+                        _logger.error("SII. Invoice: %s is marked as sent but don't have results" % invoice)
 
     @api.multi
     def action_cancel(self):
