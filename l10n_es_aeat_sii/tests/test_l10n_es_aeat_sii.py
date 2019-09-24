@@ -1,10 +1,50 @@
 # -*- coding: utf-8 -*-
 # Copyright 2017 FactorLibre - Ismael Calvo <ismael.calvo@factorlibre.com>
 # License AGPL-3.0 or later (http://www.gnu.org/licenses/agpl.html)
-
+from enum import Enum
 from openerp.tests import common
-from openerp import exceptions
+from openerp import exceptions, api
 from datetime import datetime
+from openerp.addons.l10n_es_aeat_sii.models.account_invoice import AccountInvoice as AI
+
+AI.l10n_es_aeat_sii_test_send_soap = AI._send_soap
+
+
+class ResponseType(Enum):
+    correct = 'correct'
+    incorrect = 'incorrect'
+    exception = 'exception'
+
+
+SII_RESPONSES = {
+    ResponseType.correct.value: {
+        'EstadoEnvio': 'Correcto',
+        'CSV': 'TEST-CORRECT-CSV',
+        'RespuestaLinea': [{
+            'CodigoErrorRegistro': None
+        }]
+    },
+    ResponseType.incorrect.value: {
+        'EstadoEnvio': 'Incorrecto',
+        'RespuestaLinea': [{
+            'CodigoErrorRegistro': 1111111,
+            'DescripcionErrorRegistro': 'Test incorrect response - DescripcionErrorRegistro'
+        }]
+    },
+    ResponseType.exception.value: {}
+}
+
+
+@api.multi
+def _send_soap(self, wsdl, port_name, operation, param1, param2):
+    self.ensure_one()
+    sii_response_type_by_invoice_id = self._context.get('sii_response_type_by_invoice_id', False)
+    if sii_response_type_by_invoice_id is False:
+        return self.l10n_es_aeat_sii_test_send_soap(wsdl, port_name, operation, param1, param2)
+    return SII_RESPONSES[sii_response_type_by_invoice_id[self.id]]
+
+
+AI._send_soap = _send_soap
 
 
 def _deep_sort(obj):
@@ -30,7 +70,12 @@ class TestL10nEsAeatSii(common.TransactionCase):
         super(TestL10nEsAeatSii, self).setUp()
         self.partner = self.env['res.partner'].create({
             'name': 'Test partner',
-            'vat': 'ESF35999705'
+            'vat': 'ESF35999705',
+            'is_company': True,
+            'state_id': self.env.ref('l10n_es_toponyms.ES20').id,
+            'city': 'Oiartzun',
+            'country_id': self.env.ref('base.es').id,
+            'zip': 20180
         })
         self.product = self.env['product.product'].create({
             'name': 'Test product',
@@ -78,6 +123,8 @@ class TestL10nEsAeatSii(common.TransactionCase):
         self.invoice = self.env['account.invoice'].create({
             'partner_id': self.partner.id,
             'type': 'out_invoice',
+            'fiscal_position': self.env.ref('l10n_es.fp_nacional').id,
+            'registration_key': self.env.ref('l10n_es_aeat_sii.aeat_sii_mapping_registration_keys_01').id,
             'period_id': self.period.id,
             'account_id': self.partner.property_account_payable.id,
             'invoice_line': [
@@ -88,7 +135,7 @@ class TestL10nEsAeatSii(common.TransactionCase):
                     'name': 'Test line',
                     'price_unit': 100,
                     'quantity': 1,
-                    'invoice_line_tax_id': [(6, 0, self.tax.ids)],
+                    'invoice_line_tax_id': [(6, 0, [self.env.ref('l10n_es.account_tax_template_p_iva10_bc').id])],
                 })]
         })
 
@@ -131,7 +178,7 @@ class TestL10nEsAeatSii(common.TransactionCase):
                 'DescripcionOperacion': u'/',
                 'ClaveRegimenEspecialOTrascendencia': special_regime,
             },
-            'PeriodoImpositivo': {
+            'PeriodoLiquidacion': {
                 'Periodo': str(self.invoice.period_id.code[:2]),
                 'Ejercicio': int(self.invoice.period_id.code[-4:])
             }
@@ -147,8 +194,17 @@ class TestL10nEsAeatSii(common.TransactionCase):
                     datetime.strptime(
                         self.invoice.date_invoice,
                         '%Y-%m-%d').strftime('%d-%m-%Y'),
-                "DesgloseFactura": {},
-                "CuotaDeducible": self.invoice.amount_tax
+                "DesgloseFactura": {
+                    'DesgloseIVA': {
+                        'DetalleIVA': [{
+                            'BaseImponible': self.invoice.invoice_line.price_unit,
+                            'CuotaSoportada': self.invoice.invoice_line.invoice_line_tax_id.amount * 100,
+                            'TipoImpositivo': self.invoice.invoice_line.invoice_line_tax_id.amount * 100
+                        }]
+                    }
+                },
+                "CuotaDeducible": self.invoice.amount_tax,
+                'ImporteTotal': self.invoice.amount_total
             })
         if invoice_type == 'R4':
             invoices = self.invoice.origin_invoices_ids
@@ -213,3 +269,43 @@ class TestL10nEsAeatSii(common.TransactionCase):
         self.invoice.journal_id.update_posted = True
         with self.assertRaises(exceptions.Warning):
             self.invoice.action_cancel()
+
+    def test_00_send_multiple_invoices(self):
+        """
+        To test:
+        1. send multiple invoices, one of them should return an error/exception (check both)
+        """
+        self.invoice.company_id.write({
+            'sii_enabled': True,
+            'use_connector': False,
+            'sii_method': 'manual',
+            'chart_template_id': self.env.ref(
+                'l10n_es.account_chart_template_pymes').id,
+            'vat': 'ESU2687761C',
+        })
+        invoice1 = self.invoice
+        invoice2 = self.invoice.copy()
+        invoice3 = self.invoice.copy()
+        invoice1.signal_workflow('invoice_open')
+        invoice2.signal_workflow('invoice_open')
+        invoice3.signal_workflow('invoice_open')
+
+        invoices = self.env['account.invoice']
+        invoices |= invoice1
+        invoices |= invoice2
+        invoices |= invoice3
+
+        invoices.with_context(sii_response_type_by_invoice_id={
+            invoice1.id: ResponseType.correct.value,
+            invoice2.id: ResponseType.incorrect.value,
+            invoice3.id: ResponseType.exception.value
+        }).send_sii()
+        self.assertTrue(invoice1.sii_sent)
+        self.assertEqual(1, len(invoice1.sii_results))
+        self.assertEqual('Correcto', invoice1.sii_results.sent_state)
+        self.assertFalse(invoice2.sii_sent)
+        self.assertEqual(1, len(invoice2.sii_results))
+        self.assertEqual('Incorrecto', invoice2.sii_results.sent_state)
+        self.assertFalse(invoice3.sii_sent)
+        self.assertEqual(1, len(invoice3.sii_results))
+        self.assertEqual(False, invoice3.sii_results.sent_state)
